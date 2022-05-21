@@ -25,8 +25,9 @@ def build_scheduler(config, optimizer, n_iter_per_epoch):
             lr_min=config.TRAIN.MIN_LR,
             warmup_lr_init=config.TRAIN.WARMUP_LR,
             warmup_t=warmup_steps,
-            cycle_limit=1,
+            cycle_limit=config.TRAIN.LR_SCHEDULER.COSINE_CYCLE_LIMIT,
             t_in_epochs=False,
+            decay_rate=config.TRAIN.LR_SCHEDULER.DECAY_RATE
         )
     elif config.TRAIN.LR_SCHEDULER.NAME == 'linear':
         lr_scheduler = LinearLRScheduler(

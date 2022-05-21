@@ -1,0 +1,20 @@
+TRAIN:
+  WARMUP_LR: 5e-7
+  BASE_LR: 5e-4
+  MIN_LR: 5e-6
+  LR_SCHEDULER:
+    NAME: "step"
+    DECAY_EPOCHS: 60
+    DECAY_RATE: 0.2
+DATA:
+  IMG_SIZE: 32
+MODEL:
+  TYPE: swin
+  NAME: swin_32x32
+  DROP_PATH_RATE: 0.2
+  SWIN:
+    EMBED_DIM: 96
+    DEPTHS: [2, 2, 6, 2]
+    NUM_HEADS: [2,4,8,16]
+    WINDOW_SIZE: 4
+    PATCH_SIZE: 4

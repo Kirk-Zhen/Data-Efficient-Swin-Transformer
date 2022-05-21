@@ -185,7 +185,6 @@ def pil_loader(path):
     else:
         with open(path, 'rb') as f:
             img = Image.open(f)
-            return img.convert('RGB')
     return img.convert('RGB')
 
 

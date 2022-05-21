@@ -7,8 +7,6 @@
 
 import os
 import time
-import json
-import random
 import argparse
 import datetime
 import numpy as np
@@ -26,8 +24,17 @@ from data import build_loader
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
-from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, \
-    reduce_tensor
+from utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor
+from losses import DistillationLoss
+from pytorch_cifar100_models.utils import get_network
+
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    # noinspection PyUnresolvedReferences
+    from apex import amp
+except ImportError:
+    amp = None
 
 
 def parse_option():
@@ -48,15 +55,12 @@ def parse_option():
                         help='no: no cache, '
                              'full: cache all data, '
                              'part: sharding the dataset into nonoverlapping pieces and only cache one piece')
-    parser.add_argument('--pretrained',
-                        help='pretrained weight from checkpoint, could be imagenet22k pretrained weight')
     parser.add_argument('--resume', help='resume from checkpoint')
     parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
     parser.add_argument('--use-checkpoint', action='store_true',
                         help="whether to use gradient checkpointing to save memory")
-    parser.add_argument('--disable_amp', action='store_true', help='Disable pytorch amp')
-    parser.add_argument('--amp-opt-level', type=str, choices=['O0', 'O1', 'O2'],
-                        help='mixed precision opt level, if O0, no amp is used (deprecated!)')
+    parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
+                        help='mixed precision opt level, if O0, no amp is used')
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
                         help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
     parser.add_argument('--tag', help='tag of experiment')
@@ -76,27 +80,26 @@ def parse_option():
 def main(config):
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
+    tboard_writer = SummaryWriter(log_dir=os.path.join(config.OUTPUT, "tensorboard"))
+
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
+    model.cuda()
     logger.info(str(model))
+
+    optimizer = build_optimizer(config, model)
+    if config.AMP_OPT_LEVEL != "O0":
+        model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False, find_unused_parameters=True)
+    model_without_ddp = model.module
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"number of params: {n_parameters}")
-    if hasattr(model, 'flops'):
-        flops = model.flops()
+    if hasattr(model_without_ddp, 'flops'):
+        flops = model_without_ddp.flops()
         logger.info(f"number of GFLOPs: {flops / 1e9}")
 
-    model.cuda()
-    model_without_ddp = model
-
-    optimizer = build_optimizer(config, model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
-    loss_scaler = NativeScalerWithGradNormCount()
-
-    if config.TRAIN.ACCUMULATION_STEPS > 1:
-        lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train) // config.TRAIN.ACCUMULATION_STEPS)
-    else:
-        lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
+    lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
     if config.AUG.MIXUP > 0.:
         # smoothing is handled with mixup label transform
@@ -105,6 +108,15 @@ def main(config):
         criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
     else:
         criterion = torch.nn.CrossEntropyLoss()
+    
+    if config.TRAIN.DISTILLATION.TYPE != 'none':
+        teacher = get_network((config.TRAIN.DISTILLATION.TEACHER, True))
+        teacher.load_state_dict(torch.load(config.TRAIN.DISTILLATION.TEACHER_CHECKPOINT))
+    else:
+        teacher = None
+    criterion = DistillationLoss(criterion, teacher, distillation_type=config.TRAIN.DISTILLATION.TYPE,
+                                alpha=config.TRAIN.DISTILLATION.ALPHA, tau=config.TRAIN.DISTILLATION.TAU)
+    
 
     max_accuracy = 0.0
 
@@ -121,16 +133,14 @@ def main(config):
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
 
     if config.MODEL.RESUME:
-        max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger)
+        max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
+        if config.TEST.TRAIN_SET_TEST_PTS > 0:
+            acc1, acc5, loss = validate(config, data_loader_train, model, config.TEST.TRAIN_SET_TEST_PTS)
+            logger.info(f"Accuracy of the network on the {config.TEST.TRAIN_SET_TEST_PTS} train images: {acc1:.1f}%")
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         if config.EVAL_MODE:
             return
-
-    if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
-        load_pretrained(config, model_without_ddp, logger)
-        acc1, acc5, loss = validate(config, data_loader_val, model)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
 
     if config.THROUGHPUT_MODE:
         throughput(data_loader_val, model, logger)
@@ -141,13 +151,25 @@ def main(config):
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler,
-                        loss_scaler)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
-                            logger)
+        loss, distill, grad_norm = train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler)
+        tboard_writer.add_scalar('loss/train/loss', loss, global_step=epoch)
+        tboard_writer.add_scalar('loss/train/distill', distill, global_step=epoch)
+        tboard_writer.add_scalar('grad_norm/train', grad_norm, global_step=epoch)
 
+        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
+            save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
+
+
+        if config.TEST.TRAIN_SET_TEST_PTS > 0:
+            acc1, acc5, loss = validate(config, data_loader_train, model, config.TEST.TRAIN_SET_TEST_PTS)
+            tboard_writer.add_scalar('acc/test/acc1', acc1, global_step=epoch)
+            tboard_writer.add_scalar('acc/test/acc5', acc5, global_step=epoch)
         acc1, acc5, loss = validate(config, data_loader_val, model)
+
+        tboard_writer.add_scalar('acc/val/acc1', acc1, global_step=epoch)
+        tboard_writer.add_scalar('acc/val/acc5', acc5, global_step=epoch)
+        tboard_writer.add_scalar('loss/val', loss, global_step=epoch)
+
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
@@ -157,7 +179,7 @@ def main(config):
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
     model.train()
     optimizer.zero_grad()
 
@@ -165,7 +187,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
-    scaler_meter = AverageMeter()
+    distill_meter = AverageMeter()
 
     start = time.time()
     end = time.time()
@@ -176,65 +198,107 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
-            outputs = model(samples)
-        loss = criterion(outputs, targets)
-        loss = loss / config.TRAIN.ACCUMULATION_STEPS
+        outputs = model(samples, ret_distill=config.TRAIN.DISTILLATION.TYPE != 'none')
 
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
-                                parameters=model.parameters(), create_graph=is_second_order,
-                                update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
-        if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
+        if config.TRAIN.ACCUMULATION_STEPS > 1:
+            loss, distill_loss = criterion(samples, outputs, targets)
+            loss = loss / config.TRAIN.ACCUMULATION_STEPS
+            if config.AMP_OPT_LEVEL != "O0":
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+            else:
+                loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(model.parameters())
+            if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step_update(epoch * num_steps + idx)
+        else:
+            loss, distill_loss = criterion(samples, outputs, targets)
             optimizer.zero_grad()
-            lr_scheduler.step_update((epoch * num_steps + idx) // config.TRAIN.ACCUMULATION_STEPS)
-        loss_scale_value = loss_scaler.state_dict()["scale"]
+            if config.AMP_OPT_LEVEL != "O0":
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+            else:
+                loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(model.parameters())
+            optimizer.step()
+            lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
 
         loss_meter.update(loss.item(), targets.size(0))
-        if grad_norm is not None:  # loss_scaler return None if not update
-            norm_meter.update(grad_norm)
-        scaler_meter.update(loss_scale_value)
+        norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
+        distill_meter.update(distill_loss)
         end = time.time()
 
         if idx % config.PRINT_FREQ == 0:
             lr = optimizer.param_groups[0]['lr']
-            wd = optimizer.param_groups[0]['weight_decay']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
             logger.info(
                 f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t wd {wd:.4f}\t'
+                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
                 f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'distill {distill_meter.val:.4f} ({distill_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
-                f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
+    return loss_meter.avg, distill_meter.avg, norm_meter.avg
+
 
 @torch.no_grad()
-def validate(config, data_loader, model):
+def validate(config, data_loader, model, max_examples=None):
     criterion = torch.nn.CrossEntropyLoss()
+    kld_crit = torch.nn.KLDivLoss()
     model.eval()
 
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     acc1_meter = AverageMeter()
     acc5_meter = AverageMeter()
+    distill_kld_meter = AverageMeter()
+
+    if max_examples is None:
+        loader = enumerate(data_loader)
+    else:
+        loader = zip(range(max_examples), data_loader)
 
     end = time.time()
-    for idx, (images, target) in enumerate(data_loader):
+    for idx, (images, target) in loader:
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
-            output = model(images)
+        x, distill = model(images, ret_distill=True)
+
+        # Since we're outputting distill, we need to do this here        
+        if config.TEST.HEAD == 'classify':
+            output = x
+        elif config.TEST.HEAD == 'distill':
+            output = distill
+        elif config.TEST.HEAD == 'both':
+            output = (x + distill) / 2
+        else:
+            raise ValueError(f"Unknown eval head {config.TEST_HEAD}")
 
         # measure accuracy and record loss
         loss = criterion(output, target)
@@ -248,6 +312,10 @@ def validate(config, data_loader, model):
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
 
+        if distill is not None:
+            kld = kld_crit(x, distill)
+            distill_kld_meter.update(kld.item(), target.size(0))
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -260,8 +328,9 @@ def validate(config, data_loader, model):
                 f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
                 f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
                 f'Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
+                f'DistKLD {distill_kld_meter.val:.3f} ({distill_kld_meter.avg:.3f})\t'
                 f'Mem {memory_used:.0f}MB')
-    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f} KLD {distill_kld_meter.avg:.3f}')
     return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
 
 
@@ -286,10 +355,10 @@ def throughput(data_loader, model, logger):
 
 
 if __name__ == '__main__':
-    args, config = parse_option()
+    _, config = parse_option()
 
-    if config.AMP_OPT_LEVEL:
-        print("[warning] Apex amp has been deprecated, please use pytorch amp instead!")
+    if config.AMP_OPT_LEVEL != "O0":
+        assert amp is not None, "amp not installed!"
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -304,9 +373,7 @@ if __name__ == '__main__':
 
     seed = config.SEED + dist.get_rank()
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     np.random.seed(seed)
-    random.seed(seed)
     cudnn.benchmark = True
 
     # linear scale the learning rate according to total batch size, may not be optimal
@@ -335,6 +402,5 @@ if __name__ == '__main__':
 
     # print config
     logger.info(config.dump())
-    logger.info(json.dumps(vars(args)))
 
     main(config)

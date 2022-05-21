@@ -13,32 +13,10 @@ from torchvision import datasets, transforms
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import Mixup
 from timm.data import create_transform
+from timm.data.transforms import _pil_interp
 
 from .cached_image_folder import CachedImageFolder
-from .imagenet22k_dataset import IN22KDATASET
 from .samplers import SubsetRandomSampler
-
-try:
-    from torchvision.transforms import InterpolationMode
-
-
-    def _pil_interp(method):
-        if method == 'bicubic':
-            return InterpolationMode.BICUBIC
-        elif method == 'lanczos':
-            return InterpolationMode.LANCZOS
-        elif method == 'hamming':
-            return InterpolationMode.HAMMING
-        else:
-            # default bilinear, do we want to allow nearest?
-            return InterpolationMode.BILINEAR
-
-
-    import timm.data.transforms as timm_transforms
-
-    timm_transforms._pil_interp = _pil_interp
-except:
-    from timm.data.transforms import _pil_interp
 
 
 def build_loader(config):
@@ -59,12 +37,8 @@ def build_loader(config):
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
 
-    if config.TEST.SEQUENTIAL:
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    else:
-        sampler_val = torch.utils.data.distributed.DistributedSampler(
-            dataset_val, shuffle=False
-        )
+    indices = np.arange(dist.get_rank(), len(dataset_val), dist.get_world_size())
+    sampler_val = SubsetRandomSampler(indices)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -108,16 +82,14 @@ def build_dataset(is_train, config):
             root = os.path.join(config.DATA.DATA_PATH, prefix)
             dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
-    elif config.DATA.DATASET == 'imagenet22K':
-        prefix = 'ILSVRC2011fall_whole'
-        if is_train:
-            ann_file = prefix + "_map_train.txt"
-        else:
-            ann_file = prefix + "_map_val.txt"
-        dataset = IN22KDATASET(config.DATA.DATA_PATH, ann_file, transform)
-        nb_classes = 21841
+    elif config.DATA.DATASET == 'cifar10':
+        dataset = datasets.CIFAR10(root='./data/cifar10', train=is_train, download=True, transform=transform)
+        nb_classes = 10
+    elif config.DATA.DATASET == 'cifar100':
+        dataset = datasets.CIFAR100(root='./data/cifar100', train=is_train, download=True, transform=transform)
+        nb_classes = 100
     else:
-        raise NotImplementedError("We only support ImageNet Now.")
+        raise NotImplementedError("Supported CIFAR-10, CIFAR-100, and ImageNet.")
 
     return dataset, nb_classes
 

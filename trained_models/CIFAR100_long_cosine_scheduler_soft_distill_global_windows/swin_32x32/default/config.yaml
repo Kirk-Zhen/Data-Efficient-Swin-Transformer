@@ -1,0 +1,112 @@
+AMP_OPT_LEVEL: O1
+AUG:
+  AUTO_AUGMENT: rand-m9-mstd0.5-inc1
+  COLOR_JITTER: 0.4
+  CUTMIX: 1.0
+  CUTMIX_MINMAX: null
+  MIXUP: 0.8
+  MIXUP_MODE: batch
+  MIXUP_PROB: 1.0
+  MIXUP_SWITCH_PROB: 0.5
+  RECOUNT: 1
+  REMODE: pixel
+  REPROB: 0.25
+BASE:
+- ''
+DATA:
+  BATCH_SIZE: 128
+  CACHE_MODE: part
+  DATASET: cifar100
+  DATA_PATH: ''
+  IMG_SIZE: 32
+  INTERPOLATION: bicubic
+  NUM_WORKERS: 16
+  PIN_MEMORY: true
+  ZIP_MODE: false
+EVAL_MODE: true
+LOCAL_RANK: 0
+MODEL:
+  DROP_PATH_RATE: 0.2
+  DROP_RATE: 0.0
+  LABEL_SMOOTHING: 0.1
+  NAME: swin_32x32
+  NUM_CLASSES: 1000
+  RESUME: ''
+  SWIN:
+    APE: false
+    ATTENTION_TYPE: global
+    DEPTHS:
+    - 2
+    - 2
+    - 6
+    EMBED_DIM: 96
+    IN_CHANS: 3
+    MLP_RATIO: 4.0
+    NUM_HEADS:
+    - 3
+    - 6
+    - 12
+    PATCH_NORM: true
+    PATCH_SIZE: 4
+    QKV_BIAS: true
+    QK_SCALE: null
+    WINDOW_SIZE: 4
+  SWIN_MLP:
+    APE: false
+    DEPTHS:
+    - 2
+    - 2
+    - 6
+    - 2
+    EMBED_DIM: 96
+    IN_CHANS: 3
+    MLP_RATIO: 4.0
+    NUM_HEADS:
+    - 3
+    - 6
+    - 12
+    - 24
+    PATCH_NORM: true
+    PATCH_SIZE: 4
+    WINDOW_SIZE: 7
+  TYPE: swin
+OUTPUT: output/CIFAR100_8_long_cosine_scheduler_soft_distill_global_windows/swin_32x32/default
+PRINT_FREQ: 1
+SAVE_FREQ: 10
+SEED: 0
+TAG: default
+TEST:
+  CROP: true
+  HEAD: classify
+  TRAIN_SET_TEST_PTS: 100
+THROUGHPUT_MODE: false
+TRAIN:
+  ACCUMULATION_STEPS: 2
+  AUTO_RESUME: true
+  BASE_LR: 0.0005
+  CLIP_GRAD: 5.0
+  DISTILLATION:
+    ALPHA: 0.5
+    TAU: 1.0
+    TEACHER: densenet121
+    TEACHER_CHECKPOINT: pytorch_cifar100_models/saved_models/densenet121.pth
+    TYPE: soft
+  EPOCHS: 1100
+  LR_SCHEDULER:
+    COSINE_CYCLE_LIMIT: 4
+    DECAY_EPOCHS: 60
+    DECAY_RATE: 0.5
+    NAME: cosine
+  MIN_LR: 2.5e-06
+  OPTIMIZER:
+    BETAS:
+    - 0.9
+    - 0.999
+    EPS: 1.0e-08
+    MOMENTUM: 0.9
+    NAME: adamw
+  START_EPOCH: 0
+  USE_CHECKPOINT: false
+  WARMUP_EPOCHS: 100
+  WARMUP_LR: 2.5e-07
+  WEIGHT_DECAY: 0.05

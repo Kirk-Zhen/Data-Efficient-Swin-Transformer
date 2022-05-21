@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import torch.nn.functional as F
 
 
 class Mlp(nn.Module):
@@ -117,6 +118,14 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
+
+        if N == self.window_size[0] * self.window_size[1] + 1:
+            is_distill = True
+        elif N == self.window_size[0] * self.window_size[1]:
+            is_distill = False
+        else:
+            raise RuntimeError(f"Dimensions {B_} {N} {C} are incorrect")
+
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
@@ -126,12 +135,24 @@ class WindowAttention(nn.Module):
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+        
+        # relative position bias doesn't make a lot of sense for a distillation embedding
+        # Attention is examples x examples, and we just don't do these operations for any attention vec
+        # that touches the distillation token
+        if is_distill:
+            attn[..., :-1, :-1] = attn[..., :-1, :-1] + relative_position_bias.unsqueeze(0)
+        else:
+            attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            if is_distill:
+                nW = mask.shape[0]
+                attn_mask = attn[..., :-1, :-1].view(B_ // nW, nW, self.num_heads, N-1, N-1) + mask.unsqueeze(1).unsqueeze(0)
+                attn[..., :-1, :-1] = attn_mask.view(-1, self.num_heads, N-1, N-1)
+            else:
+                nW = mask.shape[0]
+                attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
             attn = self.softmax(attn)
@@ -156,7 +177,7 @@ class WindowAttention(nn.Module):
         #  x = (attn @ v)
         flops += self.num_heads * N * N * (self.dim // self.num_heads)
         # x = self.proj(x)
-        flops += N * self.dim * self.dim
+        flops += N * self.dim * self.dim 
         return flops
 
 
@@ -181,14 +202,25 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 use_distill=False, attention_type='swin'):
         super().__init__()
+        self.attention_type = attention_type
         self.dim = dim
         self.input_resolution = input_resolution
         self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
+        if self.attention_type == 'swin':
+            self.window_size = window_size
+            self.shift_size = shift_size
+        elif self.attention_type == 'global':
+            assert min(self.input_resolution) == max(self.input_resolution)
+            self.window_size = min(self.input_resolution)
+            self.shift_size = 0
+        else:
+            raise RuntimeError(f"Unsupported attention type {self.attention_type}")
+
+
         if min(self.input_resolution) <= self.window_size:
             # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
@@ -196,6 +228,7 @@ class SwinTransformerBlock(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
+
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
@@ -230,13 +263,23 @@ class SwinTransformerBlock(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
+        self.use_distill = use_distill
+
     def forward(self, x):
+        if self.use_distill:
+            dist_token = x[:, -1, :]
+            x = x[:, :-1, :]
+
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
+        if self.use_distill:
+            x = torch.cat((x, dist_token[:, None, :]), dim=1) # roll in the distillation token
         shortcut = x
         x = self.norm1(x)
+        if self.use_distill:
+            dist_token, x = (x[:, -1, :], x[:, :-1, :]) # roll it back out before cyclic shift
         x = x.view(B, H, W, C)
 
         # cyclic shift
@@ -244,13 +287,30 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
-
+            
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        if self.use_distill:
+            # We want dist_token to attend to every window, so we append it to each window
+            # Batches go first in x_windows, so we are appending strided ever B
+            assert x_windows.shape[0] % dist_token.shape[0] == 0, "dimensions incorrect somewhere"
+            n_windows = x_windows.shape[0] // dist_token.shape[0]
+            expanded_distillation = torch.repeat_interleave(dist_token[:, None, :], n_windows, dim=0)
+            x_windows = torch.cat((x_windows, expanded_distillation), dim=1)
+            # x_windows is then nW*B, window_size*window_size+1, C
 
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+
+        if self.use_distill:
+            dist_token = attn_windows[:, -1, :]
+            # Go ahead and avg pool it here
+            dist_token = dist_token.view(B, -1, C) # B * nwindows * C
+            dist_token = torch.swapaxes(dist_token, -1, -2) # we want to pool out nwindows
+            dist_token = torch.nn.functional.adaptive_avg_pool1d(dist_token, 1).squeeze()
+
+            attn_windows = attn_windows[:, :-1, :]
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -262,9 +322,11 @@ class SwinTransformerBlock(nn.Module):
         else:
             x = shifted_x
         x = x.view(B, H * W, C)
-        x = shortcut + self.drop_path(x)
 
+        if self.use_distill:
+            x = torch.cat((x, dist_token[:, None, :]), dim=1) # roll in the distillation token again
         # FFN
+        x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
@@ -276,15 +338,19 @@ class SwinTransformerBlock(nn.Module):
     def flops(self):
         flops = 0
         H, W = self.input_resolution
+        maybe_distill = (1 if self.use_distill else 0)
         # norm1
-        flops += self.dim * H * W
+        flops += self.dim * (H * W + maybe_distill)
         # W-MSA/SW-MSA
         nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
+        flops += nW * self.attn.flops(self.window_size * self.window_size + maybe_distill)
         # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
+        flops += 2 * (H * W + maybe_distill) * self.dim * self.dim * self.mlp_ratio
         # norm2
-        flops += self.dim * H * W
+        flops += self.dim * (H * W + maybe_distill)
+        # avg pooling the distillation token
+        if self.use_distill:
+            flops += self.dim * nW
         return flops
 
 
@@ -303,6 +369,7 @@ class PatchMerging(nn.Module):
         self.dim = dim
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
+        self.output_dim = 2 * dim
 
     def forward(self, x):
         """
@@ -311,9 +378,13 @@ class PatchMerging(nn.Module):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+        # assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
 
         x = x.view(B, H, W, C)
+
+        pad_input = ((H % 2 == 1) or (W % 2 == 1))
+        if pad_input:
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
 
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
@@ -326,6 +397,10 @@ class PatchMerging(nn.Module):
         x = self.reduction(x)
 
         return x
+    
+    def get_output_dim(self) -> int:
+        return self.output_dim
+
 
     def extra_repr(self) -> str:
         return f"input_resolution={self.input_resolution}, dim={self.dim}"
@@ -359,13 +434,15 @@ class BasicLayer(nn.Module):
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
+                 use_distill=False, attention_type='swin'):
 
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
         self.use_checkpoint = use_checkpoint
+        self.use_distill = use_distill
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -376,12 +453,20 @@ class BasicLayer(nn.Module):
                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer)
+                                 norm_layer=norm_layer,
+                                 use_distill=use_distill,
+                                 attention_type=attention_type)
             for i in range(depth)])
 
         # patch merging layer
         if downsample is not None:
             self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+            if self.downsample.get_output_dim() != dim:
+                self.distillation_gate = nn.Linear(dim, self.downsample.get_output_dim())
+                self.distill_flops = dim * self.downsample.get_output_dim()
+            else:
+                self.distillation_gate = nn.Identity()
+                self.distill_flops = 0
         else:
             self.downsample = None
 
@@ -392,7 +477,12 @@ class BasicLayer(nn.Module):
             else:
                 x = blk(x)
         if self.downsample is not None:
+            if self.use_distill:
+                dist_token, x = (x[:, -1, :], x[:, :-1, :]) # roll distill out 
+                dist_token = self.distillation_gate(dist_token)
             x = self.downsample(x)
+            if self.use_distill:
+                x = torch.cat((x, dist_token[:, None, :]), dim=1) # roll in the distillation token
         return x
 
     def extra_repr(self) -> str:
@@ -404,6 +494,8 @@ class BasicLayer(nn.Module):
             flops += blk.flops()
         if self.downsample is not None:
             flops += self.downsample.flops()
+            if self.use_distill:
+                flops += self.distill_flops
         return flops
 
 
@@ -418,7 +510,7 @@ class PatchEmbed(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer. Default: None
     """
 
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -438,10 +530,19 @@ class PatchEmbed(nn.Module):
             self.norm = None
 
     def forward(self, x):
-        B, C, H, W = x.shape
+        _, _, H, W = x.shape
         # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        # assert H == self.img_size[0] and W == self.img_size[1], \
+        #     f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+
+        pad_input = (H % self.patch_size[0] != 0) or (W % self.patch_size[1] != 0)
+        if pad_input:
+            x = F.pad(x, (
+                0, self.patch_size[1] - W % self.patch_size[1], 
+                0, self.patch_size[0] - W % self.patch_size[0], 
+                0, 0
+            ))
+
         x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
         if self.norm is not None:
             x = self.norm(x)
@@ -481,12 +582,15 @@ class SwinTransformer(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
     """
 
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
-                 embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
-                 window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, num_classes=100,
+                 embed_dim=96, depths=[2, 2, 6], num_heads=[3, 6, 12],
+                 window_size=4, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, **kwargs):
+                 use_checkpoint=False,
+                 use_distill=False,
+                 attention_type='swin',
+                 eval_head='classify', **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -496,6 +600,7 @@ class SwinTransformer(nn.Module):
         self.patch_norm = patch_norm
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
+        self.eval_head = eval_head
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -530,7 +635,9 @@ class SwinTransformer(nn.Module):
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                               use_checkpoint=use_checkpoint)
+                               use_checkpoint=use_checkpoint,
+                               use_distill=use_distill,
+                               attention_type=attention_type)
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
@@ -538,6 +645,11 @@ class SwinTransformer(nn.Module):
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
         self.apply(self._init_weights)
+
+        self.use_distill = use_distill
+        if self.use_distill:
+            self.head_distill = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+            self.dist_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -557,23 +669,48 @@ class SwinTransformer(nn.Module):
         return {'relative_position_bias_table'}
 
     def forward_features(self, x):
-        x = self.patch_embed(x)
+        x = self.patch_embed(x) # should be B L C after this?
         if self.ape:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
+        if self.use_distill:
+            x = torch.cat((x, self.dist_token.repeat(x.shape[0], 1, 1)), dim=1) # roll in the distillation token
+
         for layer in self.layers:
             x = layer(x)
+                
+        if self.use_distill:
+            dist_token, x = (x[:, -1, :], x[:, :-1, :]) # roll distill out 
+        else:
+            dist_token = None
+        
 
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        return x
+        return x, dist_token
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, ret_distill=False):
+        x, dist_token = self.forward_features(x)
         x = self.head(x)
-        return x
+        if self.use_distill:
+            distill_pred = self.head_distill(dist_token)
+            if ret_distill:
+                return x, distill_pred
+            else:
+                if self.eval_head == 'classify':
+                    return x
+                elif self.eval_head == 'distill':
+                    return distill_pred
+                elif self.eval_head == 'both':
+                    return (x + distill_pred) / 2
+                else:
+                    raise ValueError(f"Unknown eval head {self.eval_head}")
+        else:
+            if ret_distill:
+                return x, None
+            return x
 
     def flops(self):
         flops = 0
@@ -582,4 +719,6 @@ class SwinTransformer(nn.Module):
             flops += layer.flops()
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.num_classes
+        if self.use_distill:
+            flops += self.num_features * self.num_classes
         return flops
