@@ -25,6 +25,13 @@ python -m torch.distributed.launch --nproc_per_node 1 --master_port 12345 main.p
     --opts EVAL_MODE True \
 ```
 
+
+## Result
+
+<img src="figures/res_main.png" width="700"/>
+<img src="figures/res_time.png" width="600"/>
+<img src="figures/res_acc.png" width="450"/>
+
 <!-- ---
 Trained models using Swin Transformer only, `.yaml` file that record hyper-parameters are provided in the `configs` folder. All hyper-parameter setting of the experiment in our report can be find in the folder:
 
