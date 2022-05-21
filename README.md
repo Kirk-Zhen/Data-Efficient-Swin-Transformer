@@ -10,8 +10,7 @@
 
 ![teaser](figures/teaser.png)
 <!-- ![teaser](figures/w-msa-distill.png) -->
-<img src="figures/DeiT_model.png" width="250"/>
-<img src="figures/w-msa-distill.png" width="250"/>
+<img src="figures/DeiT_model.png" width="250"/> <img src="figures/w-msa-distill.png" width="250"/>
 
 
 
