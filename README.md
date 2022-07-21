@@ -4,7 +4,7 @@
 
 **Swin Transformer** is initially described in [Liu, et al.](https://arxiv.org/abs/2103.14030), which capably serves as a general-purpose backbone for computer vision. It is basically a hierarchical Transformer whose representation is computed with shifted windows. The shifted windowing scheme brings greater efficiency by limiting self-attention computation to non-overlapping local windows while also allowing for cross-window connection.
 
-**DeiT** is a initially proposed by [Touvron, et al.](https://arxiv.org/pdf/2012.12877), which introduced a a teacher-student strategy specific to transformers, hence to enable a more efficient attention-based mechanism for vision tasks by applying knowledge distillation .
+**DeiT** is proposed by [Touvron, et al.](https://arxiv.org/pdf/2012.12877), which introduced a a teacher-student strategy specific to transformers, hence to enable a more efficient attention-based mechanism for vision tasks by applying knowledge distillation .
 
 **Our work** combines the two mechanisms described above and achieves a desired result.
 
