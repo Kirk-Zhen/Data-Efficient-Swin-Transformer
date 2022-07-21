@@ -8,6 +8,30 @@
 
 **Our work** combines the two mechanisms described above and achieves a desired result.
 
+##### BibTex Citation for Swin Transformer:
+```
+@inproceedings{liu2021Swin,
+  title={Swin Transformer: Hierarchical Vision Transformer using Shifted Windows},
+  author={Liu, Ze and Lin, Yutong and Cao, Yue and Hu, Han and Wei, Yixuan and Zhang, Zheng and Lin, Stephen and Guo, Baining},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  year={2021}
+}
+```
+
+
+##### BibTex Citation for DeiT:
+```
+@InProceedings{pmlr-v139-touvron21a,
+  title =     {Training data-efficient image transformers &amp; distillation through attention},
+  author =    {Touvron, Hugo and Cord, Matthieu and Douze, Matthijs and Massa, Francisco and Sablayrolles, Alexandre and Jegou, Herve},
+  booktitle = {International Conference on Machine Learning},
+  pages =     {10347--10357},
+  year =      {2021},
+  volume =    {139},
+  month =     {July}
+}
+```
+
 ![teaser](figures/teaser.png)
 <!-- ![teaser](figures/w-msa-distill.png) -->
 <img src="figures/DeiT_model.png" width="250"/> <img src="figures/w-msa-distill.png" width="250"/>
